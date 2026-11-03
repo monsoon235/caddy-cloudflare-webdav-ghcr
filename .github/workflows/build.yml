@@ -1,0 +1,146 @@
+name: build
+
+on:
+  schedule:
+    # every day, a build only happens when caddy or one of the plugins changed
+    - cron: "23 3 * * *"
+  push:
+    branches: [main]
+    paths: [Dockerfile]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "build even if nothing changed upstream"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: caddy-cloudflare-webdav
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.v.outputs.image }}
+      caddy: ${{ steps.v.outputs.caddy }}
+      cloudflare: ${{ steps.v.outputs.cloudflare }}
+      webdav: ${{ steps.v.outputs.webdav }}
+      key: ${{ steps.v.outputs.key }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: look at upstream
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          DOCKERFILE_HASH: ${{ hashFiles('Dockerfile') }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          # latest release of caddy without the leading v
+          caddy=$(gh api repos/caddyserver/caddy/releases/latest --jq .tag_name)
+          caddy=${caddy#v}
+          # the plugins have no useful tags, follow the head of their default branch
+          cloudflare=$(gh api repos/caddy-dns/cloudflare/commits/HEAD --jq .sha)
+          webdav=$(gh api repos/mholt/caddy-webdav/commits/HEAD --jq .sha)
+          key=$(printf '%s\n' "$caddy" "$cloudflare" "$webdav" "$DOCKERFILE_HASH" | sha256sum | cut -c1-12)
+
+          build=true
+          if [ "${FORCE:-false}" != "true" ] && docker buildx imagetools inspect "$image:src-$key" >/dev/null 2>&1; then
+            build=false
+          fi
+
+          {
+            echo "image=$image"
+            echo "caddy=$caddy"
+            echo "cloudflare=$cloudflare"
+            echo "webdav=$webdav"
+            echo "key=$key"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+          echo "caddy $caddy, cloudflare ${cloudflare:0:12}, webdav ${webdav:0:12}, key $key, build $build" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: amd64-v1, platform: linux/amd64, goamd64: v1 }
+          - { name: amd64-v2, platform: linux/amd64, goamd64: v2 }
+          - { name: amd64-v3, platform: linux/amd64, goamd64: v3 }
+          - { name: amd64-v4, platform: linux/amd64, goamd64: v4 }
+          - { name: arm64, platform: linux/arm64, goamd64: v1 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          # attestations would turn every tag into an index, keep them plain images
+          provenance: false
+          sbom: false
+          build-args: |
+            CADDY_VERSION=${{ needs.check.outputs.caddy }}
+            GOAMD64=${{ matrix.goamd64 }}
+            CLOUDFLARE_REF=${{ needs.check.outputs.cloudflare }}
+            WEBDAV_REF=${{ needs.check.outputs.webdav }}
+          tags: |
+            ${{ needs.check.outputs.image }}:${{ needs.check.outputs.caddy }}-${{ matrix.name }}
+            ${{ needs.check.outputs.image }}:latest-${{ matrix.name }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+
+  manifest:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # latest and the version are multi-arch (x86-64 v1 and arm64), the v2 to v4 builds are only
+      # available through their own tags. src-<key> marks the upstream state that has been built.
+      - name: multi-arch tags
+        env:
+          IMAGE: ${{ needs.check.outputs.image }}
+          CADDY: ${{ needs.check.outputs.caddy }}
+          KEY: ${{ needs.check.outputs.key }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "$IMAGE:latest" -t "$IMAGE:$CADDY" -t "$IMAGE:src-$KEY" \
+            "$IMAGE:$CADDY-amd64-v1" "$IMAGE:$CADDY-arm64"
+          docker buildx imagetools inspect "$IMAGE:latest"
